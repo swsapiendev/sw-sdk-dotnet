@@ -1,0 +1,147 @@
+# Compila, prueba y publica SW-sdk y SW-sdk-45 en nuget.org.
+#   - PR a develop/master  -> solo compila y prueba.
+#   - push a develop       -> publica <version>-rc
+#   - push a master        -> publica <version>
+# La version sale de [assembly: AssemblyVersion] en Properties/AssemblyInfo.cs.
+# La publicacion usa Trusted Publishing (OIDC): no hay API key guardada.
+# https://learn.microsoft.com/en-us/nuget/nuget-org/trusted-publishing
+
+name: Build & Publish NuGet
+
+on:
+  push:
+    branches: [develop, master]
+  pull_request:
+    branches: [develop, master]
+  workflow_dispatch:
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    env:
+      SDKTEST_USER: ${{ secrets.SDKTEST_USER }}
+      SDKTEST_PASSWORD: ${{ secrets.SDKTEST_PASSWORD }}
+      SDKTEST_TOKEN: ${{ secrets.SDKTEST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preflight validation
+        shell: pwsh
+        run: |
+          $errors = @()
+          if ([string]::IsNullOrEmpty($env:SDKTEST_TOKEN))    { $errors += "SDKTEST_TOKEN no esta definida" }
+          if ([string]::IsNullOrEmpty($env:SDKTEST_PASSWORD)) { $errors += "SDKTEST_PASSWORD no esta definida" }
+          if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Host "::error::$_" }; exit 1 }
+          Write-Host "Preflight OK!"
+
+      - uses: NuGet/setup-nuget@v2
+        with:
+          nuget-version: '7.6.0'
+
+      - uses: microsoft/setup-msbuild@v2
+
+      # El runner no trae los reference assemblies de .NET 3.5/4.0/4.5 (igual que en Azure DevOps).
+      - name: Install legacy .NET targeting packs
+        shell: pwsh
+        run: |
+          $refpacksDir = Join-Path $env:RUNNER_TEMP 'refpacks'
+          $baseDir     = 'C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework'
+          $packs = @(
+              @{ Id = 'Microsoft.NETFramework.ReferenceAssemblies.net35'; Version = 'v3.5' },
+              @{ Id = 'Microsoft.NETFramework.ReferenceAssemblies.net40'; Version = 'v4.0' },
+              @{ Id = 'Microsoft.NETFramework.ReferenceAssemblies.net45'; Version = 'v4.5' }
+          )
+          foreach ($pack in $packs) {
+              nuget install $pack.Id -OutputDirectory $refpacksDir -NonInteractive
+              $src = Get-Item (Join-Path $refpacksDir "$($pack.Id)*") | Select-Object -First 1
+              $src = Join-Path $src.FullName "build\.NETFramework\$($pack.Version)"
+              $dst = Join-Path $baseDir $pack.Version
+              if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Path $dst | Out-Null }
+              Copy-Item -Path "$src\*" -Destination $dst -Recurse -Force
+          }
+          # Client Profile de v3.5 (lo usa SW-sdk)
+          $clientProfileDir = Join-Path $baseDir 'v3.5\Profile\Client'
+          if (-not (Test-Path $clientProfileDir)) { New-Item -ItemType Directory -Path $clientProfileDir | Out-Null }
+          Copy-Item -Path (Join-Path $baseDir 'v3.5\*') -Destination $clientProfileDir -Recurse -Force -Exclude 'Profile'
+
+      - name: NuGet restore
+        run: nuget restore SW-sdk.sln -NonInteractive
+
+      - name: Build
+        run: msbuild SW-sdk.sln /t:Build /p:Configuration=Release /p:Platform="Any CPU" /m
+
+      # Los tests leen Resources/ con rutas relativas: se corren desde su carpeta bin.
+      - name: Run tests
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vstest  = & $vswhere -latest -products * -find '**\TestPlatform\vstest.console.exe' | Select-Object -First 1
+          $failed = $false
+          foreach ($proj in 'Test_SW-sdk', 'Test_SW-sdk-45') {
+              Push-Location "$proj\bin\Release"
+              & $vstest "$proj.dll" /Logger:trx /ResultsDirectory:"$env:GITHUB_WORKSPACE\TestResults"
+              if ($LASTEXITCODE -ne 0) { $failed = $true }
+              Pop-Location
+          }
+          if ($failed) { exit 1 }
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: TestResults/
+          if-no-files-found: ignore
+
+      - name: NuGet pack
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        run: |
+          $suffix = if ('${{ github.ref_name }}' -eq 'develop') { @('-Suffix', 'rc') } else { @() }
+          foreach ($proj in 'SW-sdk\SW-sdk.csproj', 'SW-sdk-45\SW-sdk-45.csproj') {
+              nuget pack $proj -Properties Configuration=Release -IncludeReferencedProjects -OutputDirectory out -NonInteractive @suffix
+              if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+          Get-ChildItem out\*.nupkg | ForEach-Object { Write-Host "Paquete: $($_.Name)" }
+
+      - name: Upload packages
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkg
+          path: out/*.nupkg
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.event_name == 'push' && (github.ref_name == 'develop' || github.ref_name == 'master')
+    runs-on: windows-2022
+    environment: release
+    permissions:
+      id-token: write   # OIDC para Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: nupkg
+          path: out
+
+      - name: NuGet login (OIDC -> API key temporal)
+        id: login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
+      - name: NuGet push
+        shell: pwsh
+        run: |
+          foreach ($pkg in Get-ChildItem out\*.nupkg) {
+              dotnet nuget push $pkg.FullName --api-key ${{ steps.login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json
+              if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
