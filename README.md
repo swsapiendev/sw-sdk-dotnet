@@ -29,7 +29,7 @@ Instalar la librería para .Net Framework 3.5, a traves Package Manager Console 
 Install-Package SW-sdk
 ```
 
-En caso de no utilizar Package Manager Console puedes descargar la librería directamente a traves del siguiente [link](https://github.com/lunasoft/sw-sdk-dotnet/releases) y agregarla como Referencia local a tu proyecto. Asegurate de utilizar la última versión publicada.
+En caso de no utilizar Package Manager Console puedes descargar la librería directamente a traves del siguiente [link](https://github.com/swsapiendev/sw-sdk-dotnet/releases) y agregarla como Referencia local a tu proyecto. Asegurate de utilizar la última versión publicada.
 
 # Implementaci&oacute;n #
 La librería contara con los servicios principales como lo son Timbrado de CFDI, Cancelación, Consulta estatus CFDI, etc.
